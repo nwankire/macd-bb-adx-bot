@@ -1,45 +1,37 @@
-import os, time, logging, threading, requests
-import pandas as pd
-import ta
-from datetime import datetime
+import os, requests, pandas as pd, ta
+from telegram import Bot
 from flask import Flask
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-import schedule, pytz
+from threading import Thread
+import schedule, time
+from datetime import datetime
+import pytz
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
-log = logging.getLogger()
-
+# === CONFIG ===
 TOKEN = os.getenv("TELEGRAM_TOKEN_V2")
-CHAT_ID = int(os.getenv("CHAT_ID_V2", "0"))
-TD_KEY = os.getenv("TWELVEDATA_API_KEY")
-TF = os.getenv("TIMEFRAME", "15min")
-EXPIRY = "15 Minutes" if TF == "15min" else "5 Minutes"
-NIGERIA = pytz.timezone("Africa/Lagos")
+CHAT_ID = os.getenv("CHAT_ID_V2")
+TD_API_KEY = os.getenv("TWELVEDATA_API_KEY")
+TIMEFRAME = os.getenv("TIMEFRAME", "15min")
 
-PAIRS = [("EUR/USD","EUR/USD"),("USD/JPY","USD/JPY"),("GBP/USD","GBP/USD"),
-         ("USD/CAD","USD/CAD"),("AUD/USD","AUD/USD"),("EUR/JPY","EUR/JPY"),
-         ("GBP/JPY","GBP/JPY"),("AUD/JPY","AUD/JPY"),("EUR/GBP","EUR/GBP")]
+bot = Bot(token=TOKEN)
+app = Flask(__name__)
+LAGOS = pytz.timezone("Africa/Lagos")
+PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "EUR/JPY"]
+last_signal = {}
 
-def now_nigeria(): return datetime.now(NIGERIA)
-def in_session(t): return 13 <= t.hour < 16 and t.weekday() < 5
-def market_open():
-    t = now_nigeria()
-    return t.weekday() < 5 and not (t.weekday() == 4 and t.hour >= 22) and not (t.weekday() == 0 and t.hour < 1)
+@app.route('/')
+def home(): return "MACD+BB+ADX Bot Live"
 
-def get_data(td_symbol):
-    url = f"https://api.twelvedata.com/time_series?symbol={td_symbol}&interval={TF}&outputsize=100&apikey={TD_KEY}"
+def get_data(symbol):
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={TIMEFRAME}&apikey={TD_API_KEY}&outputsize=100"
     try:
         r = requests.get(url, timeout=10).json()
         if "values" not in r: return None
         df = pd.DataFrame(r["values"])
+        df = df.astype({"open": float, "high": float, "low": float, "close": float})
+        df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"})
         df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.sort_values("datetime").reset_index(drop=True)
-        for c in ["open","high","low","close"]: df[c.capitalize()] = df[c].astype(float)
-        return df
-    except Exception as e:
-        log.error(f"Data error {td_symbol}: {e}")
-        return None
+        return df.sort_values("datetime")
+    except: return None
 
 def check_signal(df):
     if df is None or len(df) < 50: return None
@@ -60,74 +52,56 @@ def check_signal(df):
     df["adx"] = adx.adx()
     
     last, prev = df.iloc[-1], df.iloc[-2]
-    if last["adx"] < 20: return None
+    if last["adx"] < 20: return None # ADX filter: only trade strong trends
     
-    # CALL: MACD cross up + price at/below lower BB + histogram positive
+    # CALL: MACD bullish cross + price at/below lower BB + histogram positive
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
     bb_touch_low = last["Low"] <= last["bb_lower"]
     if macd_cross_up and bb_touch_low and last["macd_hist"] > 0:
         return "CALL", last["Close"], last["adx"], last["bb_lower"]
     
-    # PUT: MACD cross down + price at/above upper BB + histogram negative
+    # PUT: MACD bearish cross + price at/above upper BB + histogram negative
     macd_cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
     bb_touch_high = last["High"] >= last["bb_upper"]
     if macd_cross_down and bb_touch_high and last["macd_hist"] < 0:
         return "PUT", last["Close"], last["adx"], last["bb_upper"]
     return None
 
-async def send_signal(context, pair, td_symbol, sig):
-    direction, price, adx, bb_level = sig
-    msg = f"""[MACD+BB+ADX] {direction}
+def send_signal(pair, sig_type, price, adx, bb_level):
+    now = datetime.now(LAGOS).strftime("%H:%M")
+    expiry_time = TIMEFRAME.replace("min", " Minutes")
+    msg = f"""[MACD+BB+ADX] {sig_type} SIGNAL
 Pair: {pair}
 Price: {price:.5f}
-ADX: {adx:.1f}
-BB Level: {bb_level:.5f}
-Expiry: {EXPIRY}
-Time: {now_nigeria().strftime('%H:%M')} GMT+1"""
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-    log.info(f"Sent {direction} {pair}")
+ADX: {adx:.1f} | BB: {bb_level:.5f}
+Time: {now} GMT+1
+Expiry: {expiry_time}
+Session: 1PM-4PM GMT+1"""
+    bot.send_message(chat_id=CHAT_ID, text=msg)
 
-async def scan(context):
-    if not market_open(): return
-    t = now_nigeria()
-    if not in_session(t): return
-    log.info("Scanning MACD+BB+ADX...")
-    for pair, td_symbol in PAIRS:
-        df = get_data(td_symbol)
-        sig = check_signal(df)
-        if sig: await send_signal(context, pair, td_symbol, sig)
-        time.sleep(1)
+def run_bot():
+    global last_signal
+    now = datetime.now(LAGOS)
+    if now.hour < 13 or now.hour >= 16: return # 1PM-4PM only
+    
+    for pair in PAIRS:
+        df = get_data(pair)
+        result = check_signal(df)
+        if result:
+            sig_type, price, adx, bb_level = result
+            if last_signal.get(pair)!= sig_type:
+                send_signal(pair, sig_type, price, adx, bb_level)
+                last_signal[pair] = sig_type
+        time.sleep(2)
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = now_nigeria()
-    session = "OPEN 🟢" if in_session(t) else "CLOSED 🔴"
-    msg = f"""MACD+BB+ADX Bot
-Time: {t.strftime('%H:%M')} GMT+1
-Session: {session}
-TF: {TF}
-Expiry: {EXPIRY}"""
-    await update.message.reply_text(msg)
+schedule.every(5).minutes.do(run_bot)
 
-def run_scheduler(app):
-    loop = app.bot._application.loop
-    def job(): 
-        if market_open() and in_session(now_nigeria()): 
-            loop.create_task(scan(app.bot._application))
-    schedule.every(2).minutes.do(job)
+def run_schedule():
     while True:
         schedule.run_pending()
         time.sleep(1)
 
-app = Flask(__name__)
-@app.route('/')
-def home(): return f"MACD+BB+ADX Bot Live | TF:{TF} | {now_nigeria().strftime('%H:%M')}"
-
-def main():
-    application = Application.builder().token(TOKEN).build()
-    application.add_handler(CommandHandler("status", status))
-    threading.Thread(target=run_scheduler, args=(application,), daemon=True).start()
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
-    log.info(f"MACD+BB+ADX Bot Started | TF:{TF} | 1pm-4pm GMT+1")
-    application.run_polling()
-
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    Thread(target=run_schedule, daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
