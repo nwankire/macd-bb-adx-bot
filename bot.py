@@ -1,4 +1,4 @@
-import os, requests, pandas as pd, ta, asyncio, logging
+import os, requests, pandas as pd, ta, asyncio, logging, time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask
@@ -53,20 +53,25 @@ def check_signal(df):
     df["adx"] = adx.adx()
     last, prev = df.iloc[-1], df.iloc[-2]
     if pd.isna(last["adx"]) or last["adx"] < 20: return None
+    
+    # BUY signal
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
     bb_touch_low = last["Low"] <= last["bb_lower"]
     if macd_cross_up and bb_touch_low and last["macd_hist"] > 0:
-        return "CALL", last["Close"], last["adx"], last["bb_lower"]
+        return "BUY", last["Close"], last["adx"], last["bb_lower"]
+    
+    # SELL signal
     macd_cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
     bb_touch_high = last["High"] >= last["bb_upper"]
     if macd_cross_down and bb_touch_high and last["macd_hist"] < 0:
-        return "PUT", last["Close"], last["adx"], last["bb_upper"]
+        return "SELL", last["Close"], last["adx"], last["bb_upper"]
     return None
 
 async def send_signal(context: ContextTypes.DEFAULT_TYPE, pair, sig_type, price, adx, bb_level):
     global signal_history
     now = datetime.now(LAGOS).strftime("%H:%M")
-    msg = f"""[MACD+BB+ADX] {sig_type}
+    emoji = "🟢" if sig_type == "BUY" else "🔴"
+    msg = f"""{emoji} [MACD+BB+ADX] {sig_type}
 Pair: {pair}
 Price: {price:.5f}
 ADX: {adx:.1f} | BB: {bb_level:.5f}
@@ -139,15 +144,22 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=port)
 
 def main():
+    # ANTI-CONFLICT FIX: Kill any other bot instance before starting
+    try:
+        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=5)
+        logging.info("Dropped pending updates + killed duplicate instances")
+        time.sleep(3) # Wait for old instance to die
+    except Exception as e:
+        logging.warning(f"Could not clear webhook: {e}")
+    
     Thread(target=run_flask, daemon=True).start()
     
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("pairs", pairs_command)) # New
+    application.add_handler(CommandHandler("pairs", pairs_command))
     application.add_handler(CommandHandler("last", last_signals))
     
-    # JobQueue handles the scanner
     job_queue = application.job_queue
     job_queue.run_repeating(scan_market, interval=120, first=10)
     
