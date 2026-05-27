@@ -18,6 +18,7 @@ LAGOS = pytz.timezone("Africa/Lagos")
 PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "EUR/JPY"]
 EXPIRY = "15 Minutes" if TIMEFRAME == "15min" else "5 Minutes"
 last_signal = {}
+signal_history = [] # Stores last 3 signals
 
 @flask_app.route('/')
 def home(): 
@@ -63,6 +64,7 @@ def check_signal(df):
     return None
 
 async def send_signal(context: ContextTypes.DEFAULT_TYPE, pair, sig_type, price, adx, bb_level):
+    global signal_history
     now = datetime.now(LAGOS).strftime("%H:%M")
     msg = f"""[MACD+BB+ADX] {sig_type}
 Pair: {pair}
@@ -73,6 +75,11 @@ Expiry: {EXPIRY}
 Session: 1PM-4PM GMT+1"""
     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
     logging.info(f"Sent {sig_type} {pair}")
+    
+    # Save to history - keep last 3
+    signal_history.append(msg)
+    if len(signal_history) > 3:
+        signal_history.pop(0)
 
 async def scan_market(context: ContextTypes.DEFAULT_TYPE):
     global last_signal
@@ -92,7 +99,7 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("MACD+BB+ADX Bot is live. Use /status to check session.")
+    await update.message.reply_text("MACD+BB+ADX Bot is live. Use /status to check session. Use /last to see recent signals.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = datetime.now(LAGOS)
@@ -104,6 +111,12 @@ TF: {TIMEFRAME}
 Expiry: {EXPIRY}"""
     await update.message.reply_text(msg)
 
+async def last_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not signal_history:
+        await update.message.reply_text("No signals yet today. Session is 1PM-4PM GMT+1.")
+    else:
+        await update.message.reply_text("📊 Last signals:\n\n" + "\n\n---\n\n".join(signal_history))
+
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
@@ -114,8 +127,9 @@ def main():
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("last", last_signals)) # New command
     
-    # JobQueue handles the scanner - no more crashes
+    # JobQueue handles the scanner
     job_queue = application.job_queue
     job_queue.run_repeating(scan_market, interval=120, first=10)
     
