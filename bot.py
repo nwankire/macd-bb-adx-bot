@@ -1,16 +1,13 @@
 import os, requests, pandas as pd, ta, asyncio, logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.error import Conflict
 from flask import Flask
 from threading import Thread
 from datetime import datetime
 import pytz
 
-# === LOGGING ===
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# === ENV VARS ===
 TOKEN = os.getenv("TELEGRAM_TOKEN_V2")
 CHAT_ID = os.getenv("CHAT_ID_V2")
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY")
@@ -44,32 +41,21 @@ def get_data(symbol):
 
 def check_signal(df):
     if df is None or len(df) < 50: return None
-    
-    # Bollinger Bands
     bb = ta.volatility.BollingerBands(close=df["Close"], window=20, window_dev=2)
     df["bb_lower"] = bb.bollinger_lband()
     df["bb_upper"] = bb.bollinger_hband()
-    
-    # MACD
     macd = ta.trend.MACD(close=df["Close"], window_slow=26, window_fast=12, window_sign=9)
     df["macd"] = macd.macd()
     df["macd_signal"] = macd.macd_signal()
     df["macd_hist"] = macd.macd_diff()
-    
-    # ADX
     adx = ta.trend.ADXIndicator(high=df["High"], low=df["Low"], close=df["Close"], window=14)
     df["adx"] = adx.adx()
-    
     last, prev = df.iloc[-1], df.iloc[-2]
     if pd.isna(last["adx"]) or last["adx"] < 20: return None
-    
-    # CALL: MACD bullish cross + price at/below lower BB + histogram positive
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
     bb_touch_low = last["Low"] <= last["bb_lower"]
     if macd_cross_up and bb_touch_low and last["macd_hist"] > 0:
         return "CALL", last["Close"], last["adx"], last["bb_lower"]
-    
-    # PUT: MACD bearish cross + price at/above upper BB + histogram negative
     macd_cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
     bb_touch_high = last["High"] >= last["bb_upper"]
     if macd_cross_down and bb_touch_high and last["macd_hist"] < 0:
@@ -94,7 +80,6 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE):
     if not (13 <= now.hour < 16 and now.weekday() < 5): 
         logging.info("Outside session 1PM-4PM")
         return
-    
     logging.info("Scanning market...")
     for pair in PAIRS:
         df = get_data(pair)
@@ -106,6 +91,9 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE):
                 last_signal[pair] = sig_type
         await asyncio.sleep(2)
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("MACD+BB+ADX Bot is live. Use /status to check session.")
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = datetime.now(LAGOS)
     session = "OPEN 🟢" if 13 <= t.hour < 16 and t.weekday() < 5 else "CLOSED 🔴"
@@ -116,34 +104,23 @@ TF: {TIMEFRAME}
 Expiry: {EXPIRY}"""
     await update.message.reply_text(msg)
 
-async def scheduler_loop(app: Application):
-    while True:
-        try:
-            await scan_market(app)
-        except Exception as e:
-            logging.error(f"Scheduler error: {e}")
-        await asyncio.sleep(120) # Scan every 2 mins
-
-async def post_init(app: Application):
-    app.create_task(scheduler_loop(app))
-
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
 
 def main():
-    # Start Flask in background
     Thread(target=run_flask, daemon=True).start()
     
-    # Start Telegram bot with conflict handling
-    try:
-        application = Application.builder().token(TOKEN).post_init(post_init).build()
-        application.add_handler(CommandHandler("status", status))
-        logging.info(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
-        application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-    except Conflict:
-        logging.error("Conflict error: Another instance is running. Stopping.")
-        exit(1)
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    
+    # Use JobQueue instead of create_task - this fixes the reply bug
+    job_queue = application.job_queue
+    job_queue.run_repeating(scan_market, interval=120, first=10)
+    
+    logging.info(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
