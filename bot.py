@@ -12,27 +12,18 @@ TOKEN = os.getenv("TELEGRAM_TOKEN_V2")
 CHAT_ID = os.getenv("CHAT_ID_V2")
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 TIMEFRAME = os.getenv("TIMEFRAME", "15min")
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL") # Render gives you this automatically
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") # New: https://your-app.onrender.com/8754140336...
 
 flask_app = Flask(__name__)
 LAGOS = pytz.timezone("Africa/Lagos")
 PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "EUR/JPY"]
 EXPIRY = "15 Minutes" if TIMEFRAME == "15min" else "5 Minutes"
 last_signal = {}
-signal_history = []
+signal_history = [] 
 currently_scanning = "Idle"
-application = None # Global so Flask can access it
+application = None # Global
 
-@flask_app.route('/')
-def home(): 
-    return f"MACD+BB+ADX Bot Live | Webhook | TF:{TIMEFRAME} | {datetime.now(LAGOS).strftime('%H:%M')}"
-
-@flask_app.route(f'/{TOKEN}', methods=['POST'])
-async def webhook():
-    """Telegram sends updates here"""
-    if application:
-        await application.update_queue.put(Update.de_json(request.get_json(force=True), application.bot))
-    return 'ok'
+#... keep all your get_data, check_signal, send_signal, scan_market functions exactly the same...
 
 def get_data(symbol):
     global currently_scanning
@@ -73,13 +64,11 @@ def check_signal(df, symbol):
     if pd.isna(last["adx"]) or last["adx"] < 20: 
         currently_scanning = "Idle"
         return None
-    
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
     bb_touch_low = last["Low"] <= last["bb_lower"]
     if macd_cross_up and bb_touch_low and last["macd_hist"] > 0:
         currently_scanning = "Idle"
         return "BUY", last["Close"], last["adx"], last["bb_lower"]
-    
     macd_cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
     bb_touch_high = last["High"] >= last["bb_upper"]
     if macd_cross_down and bb_touch_high and last["macd_hist"] < 0:
@@ -101,7 +90,6 @@ Expiry: {EXPIRY}
 Session: 1PM-4PM GMT+1"""
     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
     logging.info(f"Sent {sig_type} {pair}")
-    
     signal_history.append(msg)
     if len(signal_history) > 3:
         signal_history.pop(0)
@@ -125,15 +113,9 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2)
     currently_scanning = "Idle"
 
+#... keep start, status, pairs_command, last_signals, now_command the same...
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "MACD+BB+ADX Bot is live.\n\n"
-        "Commands:\n"
-        "/status - Check session status\n"
-        "/pairs - Show pairs being scanned\n"
-        "/last - Show last 3 signals\n"
-        "/now - Show which pair is scanning now"
-    )
+    await update.message.reply_text("MACD+BB+ADX Bot is live.\n\nCommands:\n/status - Check session status\n/pairs - Show pairs being scanned\n/last - Show last 3 signals\n/now - Show which pair is scanning now")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = datetime.now(LAGOS)
@@ -143,8 +125,7 @@ Time: {t.strftime('%H:%M')} GMT+1
 Session: {session}
 TF: {TIMEFRAME}
 Expiry: {EXPIRY}
-Pairs: {len(PAIRS)} active
-Mode: Webhook ✅"""
+Pairs: {len(PAIRS)} active"""
     await update.message.reply_text(msg)
 
 async def pairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,27 +149,23 @@ async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (13 <= t.hour < 16 and t.weekday() < 5):
         await update.message.reply_text("Session closed 🔴\nBot only scans 1PM-4PM GMT+1, Mon-Fri")
         return
-    
     if currently_scanning == "Idle":
         await update.message.reply_text("⏸️ Bot is idle\nWaiting for next 2-min scan cycle...")
     else:
         await update.message.reply_text(f"🔍 {currently_scanning}")
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
+@flask_app.route('/')
+def home(): 
+    return f"MACD+BB+ADX Bot Live | TF:{TIMEFRAME} | {datetime.now(LAGOS).strftime('%H:%M')}"
 
-async def setup_webhook():
-    """Set webhook when bot starts"""
-    global application
-    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-    logging.info(f"Webhook set to {WEBHOOK_URL}/{TOKEN}")
+@flask_app.route(f'/{TOKEN}', methods=['POST']) # Webhook endpoint
+async def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    await application.process_update(update)
+    return 'ok'
 
-def main():
+async def setup():
     global application
-    
-    Thread(target=run_flask, daemon=True).start()
-    
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
@@ -199,12 +176,14 @@ def main():
     job_queue = application.job_queue
     job_queue.run_repeating(scan_market, interval=120, first=10)
     
-    # Set webhook instead of polling
-    asyncio.get_event_loop().run_until_complete(setup_webhook())
-    
-    logging.info(f"MACD+BB+ADX Bot Starting | Webhook Mode | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
-    # Keep the script running
-    asyncio.get_event_loop().run_forever()
+    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+    logging.info(f"Webhook set to {WEBHOOK_URL}/{TOKEN}")
+    logging.info(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
+
+def main():
+    asyncio.run(setup())
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
