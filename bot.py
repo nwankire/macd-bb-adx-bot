@@ -1,20 +1,27 @@
-import os, requests, pandas as pd, ta, asyncio, logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from flask import Flask, request
-from threading import Thread
+import os
+import requests
+import pandas as pd
+import ta
+import logging
 from datetime import datetime
 import pytz
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO
+)
 
+# ===== ENV VARS =====
 TOKEN = os.getenv("TELEGRAM_TOKEN_V2")
 CHAT_ID = os.getenv("CHAT_ID_V2")
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 TIMEFRAME = os.getenv("TIMEFRAME", "15min")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") # https://macd-bb-adx-bot.onrender.com
+PORT = int(os.environ.get("PORT", 10000))
 
-flask_app = Flask(__name__)
+# ===== SETTINGS =====
 LAGOS = pytz.timezone("Africa/Lagos")
 PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "EUR/JPY"]
 EXPIRY = "15 Minutes" if TIMEFRAME == "15min" else "5 Minutes"
@@ -22,32 +29,14 @@ last_signal = {}
 signal_history = []
 currently_scanning = "Idle"
 
-# Build application globally
-application = Application.builder().token(TOKEN).updater(None).build()
-
-@flask_app.route('/')
-def home(): 
-    return f"MACD+BB+ADX Bot Webhook Live | TF:{TIMEFRAME} | {datetime.now(LAGOS).strftime('%H:%M')}"
-
-@flask_app.route('/webhook', methods=['POST'])
-async def webhook():
-    """This is where Telegram sends updates"""
-    try:
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        await application.process_update(update)
-        return "ok", 200
-    except Exception as e:
-        logging.error(f"Webhook error: {e}")
-        return "error", 500
-
-# Keep all your existing functions: get_data, check_signal, send_signal, scan_market
+# ===== DATA + STRATEGY =====
 def get_data(symbol):
     global currently_scanning
     currently_scanning = f"Fetching {symbol}..."
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={TIMEFRAME}&apikey={TD_API_KEY}&outputsize=100"
     try:
         r = requests.get(url, timeout=10).json()
-        if "values" not in r: 
+        if "values" not in r:
             logging.warning(f"No data for {symbol}")
             currently_scanning = "Idle"
             return None
@@ -64,32 +53,46 @@ def get_data(symbol):
 def check_signal(df, symbol):
     global currently_scanning
     currently_scanning = f"Analyzing {symbol}..."
-    if df is None or len(df) < 50: 
+    if df is None or len(df) < 50:
         currently_scanning = "Idle"
         return None
+    
+    # Bollinger Bands
     bb = ta.volatility.BollingerBands(close=df["Close"], window=20, window_dev=2)
     df["bb_lower"] = bb.bollinger_lband()
     df["bb_upper"] = bb.bollinger_hband()
+    
+    # MACD
     macd = ta.trend.MACD(close=df["Close"], window_slow=26, window_fast=12, window_sign=9)
     df["macd"] = macd.macd()
     df["macd_signal"] = macd.macd_signal()
     df["macd_hist"] = macd.macd_diff()
+    
+    # ADX
     adx = ta.trend.ADXIndicator(high=df["High"], low=df["Low"], close=df["Close"], window=14)
     df["adx"] = adx.adx()
+    
     last, prev = df.iloc[-1], df.iloc[-2]
-    if pd.isna(last["adx"]) or last["adx"] < 20: 
+    
+    # ADX filter - only trade in trending market
+    if pd.isna(last["adx"]) or last["adx"] < 20:
         currently_scanning = "Idle"
         return None
+    
+    # BUY: MACD cross up + price touches lower BB
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
     bb_touch_low = last["Low"] <= last["bb_lower"]
     if macd_cross_up and bb_touch_low and last["macd_hist"] > 0:
         currently_scanning = "Idle"
         return "BUY", last["Close"], last["adx"], last["bb_lower"]
+    
+    # SELL: MACD cross down + price touches upper BB
     macd_cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
     bb_touch_high = last["High"] >= last["bb_upper"]
     if macd_cross_down and bb_touch_high and last["macd_hist"] < 0:
         currently_scanning = "Idle"
         return "SELL", last["Close"], last["adx"], last["bb_upper"]
+    
     currently_scanning = "Idle"
     return None
 
@@ -106,6 +109,7 @@ Expiry: {EXPIRY}
 Session: 1PM-4PM GMT+1"""
     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
     logging.info(f"Sent {sig_type} {pair}")
+    
     signal_history.append(msg)
     if len(signal_history) > 3:
         signal_history.pop(0)
@@ -113,22 +117,27 @@ Session: 1PM-4PM GMT+1"""
 async def scan_market(context: ContextTypes.DEFAULT_TYPE):
     global last_signal, currently_scanning
     now = datetime.now(LAGOS)
-    if not (13 <= now.hour < 16 and now.weekday() < 5): 
+    
+    # Only scan 1PM-4PM GMT+1 Mon-Fri
+    if not (13 <= now.hour < 16 and now.weekday() < 5):
         logging.info("Outside session 1PM-4PM")
         currently_scanning = "Session closed"
         return
+    
     logging.info("Scanning market...")
     for pair in PAIRS:
         df = get_data(pair)
         result = check_signal(df, pair)
         if result:
             sig_type, price, adx, bb_level = result
+            # Only send if signal changed
             if last_signal.get(pair)!= sig_type:
                 await send_signal(context, pair, sig_type, price, adx, bb_level)
                 last_signal[pair] = sig_type
-        await asyncio.sleep(2)
+        await asyncio.sleep(2) # Avoid rate limits
     currently_scanning = "Idle"
 
+# ===== TELEGRAM COMMANDS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "MACD+BB+ADX Bot is live.\n\n"
@@ -177,7 +186,10 @@ async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"🔍 {currently_scanning}")
 
-async def setup():
+# ===== MAIN =====
+def main():
+    application = Application.builder().token(TOKEN).build()
+    
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
@@ -185,24 +197,19 @@ async def setup():
     application.add_handler(CommandHandler("last", last_signals))
     application.add_handler(CommandHandler("now", now_command))
     
+    # Add job queue - scans every 2 minutes
     job_queue = application.job_queue
     job_queue.run_repeating(scan_market, interval=120, first=10)
     
-    # Initialize and set webhook
-    await application.initialize()
-    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", drop_pending_updates=True)
-    await application.start()
-    logging.info(f"Webhook set to {WEBHOOK_URL}/webhook")
-    logging.info(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
-
-def main():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(setup())
-    
-    # Run Flask - this blocks and keeps the bot alive
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
+    # Run webhook - this replaces Flask + polling
+    logging.info(f"Starting webhook on port {PORT}")
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=TOKEN, # Security: use token as path
+        webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
+        drop_pending_updates=True
+    )
 
 if __name__ == "__main__":
     main()
