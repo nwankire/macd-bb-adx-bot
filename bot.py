@@ -115,7 +115,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     
-    # This replaces create_task - fixes the crash
+    # JobQueue handles the scanner - no more crashes
     job_queue = application.job_queue
     job_queue.run_repeating(scan_market, interval=120, first=10)
     
