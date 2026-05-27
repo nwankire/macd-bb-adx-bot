@@ -1,6 +1,6 @@
 import os, requests, pandas as pd, ta, asyncio
-from telegram import Bot
-from telegram.ext import Application, CommandHandler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask
 from threading import Thread
 import schedule, time
@@ -13,7 +13,6 @@ CHAT_ID = os.getenv("CHAT_ID_V2")
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 TIMEFRAME = os.getenv("TIMEFRAME", "15min")
 
-bot = Bot(token=TOKEN)
 flask_app = Flask(__name__)
 LAGOS = pytz.timezone("Africa/Lagos")
 PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "EUR/JPY"]
@@ -28,13 +27,17 @@ def get_data(symbol):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={TIMEFRAME}&apikey={TD_API_KEY}&outputsize=100"
     try:
         r = requests.get(url, timeout=10).json()
-        if "values" not in r: return None
+        if "values" not in r: 
+            print(f"No data for {symbol}")
+            return None
         df = pd.DataFrame(r["values"])
         df = df.astype({"open": float, "high": float, "low": float, "close": float})
         df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"})
         df["datetime"] = pd.to_datetime(df["datetime"])
         return df.sort_values("datetime")
-    except: return None
+    except Exception as e:
+        print(f"Data error {symbol}: {e}")
+        return None
 
 def check_signal(df):
     if df is None or len(df) < 50: return None
@@ -55,7 +58,7 @@ def check_signal(df):
     df["adx"] = adx.adx()
     
     last, prev = df.iloc[-1], df.iloc[-2]
-    if last["adx"] < 20: return None
+    if pd.isna(last["adx"]) or last["adx"] < 20: return None
     
     # CALL: MACD bullish cross + price at/below lower BB + histogram positive
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
@@ -70,7 +73,7 @@ def check_signal(df):
         return "PUT", last["Close"], last["adx"], last["bb_upper"]
     return None
 
-async def send_signal(pair, sig_type, price, adx, bb_level):
+async def send_signal(context: ContextTypes.DEFAULT_TYPE, pair, sig_type, price, adx, bb_level):
     now = datetime.now(LAGOS).strftime("%H:%M")
     msg = f"""[MACD+BB+ADX] {sig_type}
 Pair: {pair}
@@ -79,26 +82,30 @@ ADX: {adx:.1f} | BB: {bb_level:.5f}
 Time: {now} GMT+1
 Expiry: {EXPIRY}
 Session: 1PM-4PM GMT+1"""
-    await bot.send_message(chat_id=CHAT_ID, text=msg)
+    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+    print(f"Sent {sig_type} {pair}")
 
-async def scan_market():
+async def scan_market(context: ContextTypes.DEFAULT_TYPE):
     global last_signal
     now = datetime.now(LAGOS)
-    if not (13 <= now.hour < 16 and now.weekday() < 5): return # 1PM-4PM Mon-Fri only
+    if not (13 <= now.hour < 16 and now.weekday() < 5): 
+        print("Outside session 1PM-4PM")
+        return
     
+    print("Scanning market...")
     for pair in PAIRS:
         df = get_data(pair)
         result = check_signal(df)
         if result:
             sig_type, price, adx, bb_level = result
             if last_signal.get(pair)!= sig_type:
-                await send_signal(pair, sig_type, price, adx, bb_level)
+                await send_signal(context, pair, sig_type, price, adx, bb_level)
                 last_signal[pair] = sig_type
         await asyncio.sleep(2)
 
-async def status(update, context):
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = datetime.now(LAGOS)
-    session = "OPEN 🟢" if 13 <= t.hour < 16 else "CLOSED 🔴"
+    session = "OPEN 🟢" if 13 <= t.hour < 16 and t.weekday() < 5 else "CLOSED 🔴"
     msg = f"""MACD+BB+ADX Bot
 Time: {t.strftime('%H:%M')} GMT+1
 Session: {session}
@@ -106,22 +113,24 @@ TF: {TIMEFRAME}
 Expiry: {EXPIRY}"""
     await update.message.reply_text(msg)
 
-async def scheduler_loop():
+async def scheduler_loop(app: Application):
     while True:
-        await scan_market()
+        await scan_market(app)
         await asyncio.sleep(120) # Scan every 2 mins
 
-async def post_init(application):
-    asyncio.create_task(scheduler_loop())
+async def post_init(app: Application):
+    asyncio.create_task(scheduler_loop(app))
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("status", status))
-    
+    # Start Flask in background
     Thread(target=run_flask, daemon=True).start()
-    print(f"MACD+BB+ADX Bot Started | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
-    app.run_polling(drop_pending_updates=True)
+    
+    # Start Telegram bot
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
+    application.add_handler(CommandHandler("status", status))
+    print(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
+    application.run_polling(drop_pending_updates=True)
