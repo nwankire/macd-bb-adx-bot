@@ -18,18 +18,22 @@ LAGOS = pytz.timezone("Africa/Lagos")
 PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "EUR/JPY"]
 EXPIRY = "15 Minutes" if TIMEFRAME == "15min" else "5 Minutes"
 last_signal = {}
-signal_history = [] # Stores last 3 signals
+signal_history = [] 
+currently_scanning = "Idle" # New: track which pair is being scanned
 
 @flask_app.route('/')
 def home(): 
     return f"MACD+BB+ADX Bot Live | TF:{TIMEFRAME} | {datetime.now(LAGOS).strftime('%H:%M')}"
 
 def get_data(symbol):
+    global currently_scanning
+    currently_scanning = f"Fetching {symbol}..."
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={TIMEFRAME}&apikey={TD_API_KEY}&outputsize=100"
     try:
         r = requests.get(url, timeout=10).json()
         if "values" not in r: 
             logging.warning(f"No data for {symbol}")
+            currently_scanning = "Idle"
             return None
         df = pd.DataFrame(r["values"])
         df = df.astype({"open": float, "high": float, "low": float, "close": float})
@@ -38,10 +42,15 @@ def get_data(symbol):
         return df.sort_values("datetime")
     except Exception as e:
         logging.error(f"Data error {symbol}: {e}")
+        currently_scanning = "Idle"
         return None
 
-def check_signal(df):
-    if df is None or len(df) < 50: return None
+def check_signal(df, symbol):
+    global currently_scanning
+    currently_scanning = f"Analyzing {symbol}..."
+    if df is None or len(df) < 50: 
+        currently_scanning = "Idle"
+        return None
     bb = ta.volatility.BollingerBands(close=df["Close"], window=20, window_dev=2)
     df["bb_lower"] = bb.bollinger_lband()
     df["bb_upper"] = bb.bollinger_hband()
@@ -52,19 +61,24 @@ def check_signal(df):
     adx = ta.trend.ADXIndicator(high=df["High"], low=df["Low"], close=df["Close"], window=14)
     df["adx"] = adx.adx()
     last, prev = df.iloc[-1], df.iloc[-2]
-    if pd.isna(last["adx"]) or last["adx"] < 20: return None
+    if pd.isna(last["adx"]) or last["adx"] < 20: 
+        currently_scanning = "Idle"
+        return None
     
     # BUY signal
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
     bb_touch_low = last["Low"] <= last["bb_lower"]
     if macd_cross_up and bb_touch_low and last["macd_hist"] > 0:
+        currently_scanning = "Idle"
         return "BUY", last["Close"], last["adx"], last["bb_lower"]
     
     # SELL signal
     macd_cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
     bb_touch_high = last["High"] >= last["bb_upper"]
     if macd_cross_down and bb_touch_high and last["macd_hist"] < 0:
+        currently_scanning = "Idle"
         return "SELL", last["Close"], last["adx"], last["bb_upper"]
+    currently_scanning = "Idle"
     return None
 
 async def send_signal(context: ContextTypes.DEFAULT_TYPE, pair, sig_type, price, adx, bb_level):
@@ -81,27 +95,28 @@ Session: 1PM-4PM GMT+1"""
     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
     logging.info(f"Sent {sig_type} {pair}")
     
-    # Save to history - keep last 3
     signal_history.append(msg)
     if len(signal_history) > 3:
         signal_history.pop(0)
 
 async def scan_market(context: ContextTypes.DEFAULT_TYPE):
-    global last_signal
+    global last_signal, currently_scanning
     now = datetime.now(LAGOS)
     if not (13 <= now.hour < 16 and now.weekday() < 5): 
         logging.info("Outside session 1PM-4PM")
+        currently_scanning = "Session closed"
         return
     logging.info("Scanning market...")
     for pair in PAIRS:
         df = get_data(pair)
-        result = check_signal(df)
+        result = check_signal(df, pair)
         if result:
             sig_type, price, adx, bb_level = result
             if last_signal.get(pair)!= sig_type:
                 await send_signal(context, pair, sig_type, price, adx, bb_level)
                 last_signal[pair] = sig_type
         await asyncio.sleep(2)
+    currently_scanning = "Idle"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -109,7 +124,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/status - Check session status\n"
         "/pairs - Show pairs being scanned\n"
-        "/last - Show last 3 signals"
+        "/last - Show last 3 signals\n"
+        "/now - Show which pair is scanning now" # New
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -139,16 +155,27 @@ async def last_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("📊 Last signals:\n\n" + "\n\n---\n\n".join(signal_history))
 
+async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE): # New
+    t = datetime.now(LAGOS)
+    if not (13 <= t.hour < 16 and t.weekday() < 5):
+        await update.message.reply_text("Session closed 🔴\nBot only scans 1PM-4PM GMT+1, Mon-Fri")
+        return
+    
+    if currently_scanning == "Idle":
+        await update.message.reply_text("⏸️ Bot is idle\nWaiting for next 2-min scan cycle...")
+    else:
+        await update.message.reply_text(f"🔍 {currently_scanning}")
+
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
 
 def main():
-    # ANTI-CONFLICT FIX: Kill any other bot instance before starting
+    # ANTI-CONFLICT FIX
     try:
         requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=5)
         logging.info("Dropped pending updates + killed duplicate instances")
-        time.sleep(3) # Wait for old instance to die
+        time.sleep(3)
     except Exception as e:
         logging.warning(f"Could not clear webhook: {e}")
     
@@ -159,6 +186,7 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("pairs", pairs_command))
     application.add_handler(CommandHandler("last", last_signals))
+    application.add_handler(CommandHandler("now", now_command)) # New
     
     job_queue = application.job_queue
     job_queue.run_repeating(scan_market, interval=120, first=10)
