@@ -1,4 +1,5 @@
 import os
+import asyncio
 import requests
 import pandas as pd
 import ta
