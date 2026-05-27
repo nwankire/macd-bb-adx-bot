@@ -1,25 +1,28 @@
-import os, requests, pandas as pd, ta
+import os, requests, pandas as pd, ta, asyncio
 from telegram import Bot
+from telegram.ext import Application, CommandHandler
 from flask import Flask
 from threading import Thread
 import schedule, time
 from datetime import datetime
 import pytz
 
-# === CONFIG ===
+# === ENV VARS ===
 TOKEN = os.getenv("TELEGRAM_TOKEN_V2")
 CHAT_ID = os.getenv("CHAT_ID_V2")
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 TIMEFRAME = os.getenv("TIMEFRAME", "15min")
 
 bot = Bot(token=TOKEN)
-app = Flask(__name__)
+flask_app = Flask(__name__)
 LAGOS = pytz.timezone("Africa/Lagos")
 PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "EUR/JPY"]
+EXPIRY = "15 Minutes" if TIMEFRAME == "15min" else "5 Minutes"
 last_signal = {}
 
-@app.route('/')
-def home(): return "MACD+BB+ADX Bot Live"
+@flask_app.route('/')
+def home(): 
+    return f"MACD+BB+ADX Bot Live | TF:{TIMEFRAME} | {datetime.now(LAGOS).strftime('%H:%M')}"
 
 def get_data(symbol):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={TIMEFRAME}&apikey={TD_API_KEY}&outputsize=100"
@@ -52,7 +55,7 @@ def check_signal(df):
     df["adx"] = adx.adx()
     
     last, prev = df.iloc[-1], df.iloc[-2]
-    if last["adx"] < 20: return None # ADX filter: only trade strong trends
+    if last["adx"] < 20: return None
     
     # CALL: MACD bullish cross + price at/below lower BB + histogram positive
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
@@ -67,22 +70,21 @@ def check_signal(df):
         return "PUT", last["Close"], last["adx"], last["bb_upper"]
     return None
 
-def send_signal(pair, sig_type, price, adx, bb_level):
+async def send_signal(pair, sig_type, price, adx, bb_level):
     now = datetime.now(LAGOS).strftime("%H:%M")
-    expiry_time = TIMEFRAME.replace("min", " Minutes")
-    msg = f"""[MACD+BB+ADX] {sig_type} SIGNAL
+    msg = f"""[MACD+BB+ADX] {sig_type}
 Pair: {pair}
 Price: {price:.5f}
 ADX: {adx:.1f} | BB: {bb_level:.5f}
 Time: {now} GMT+1
-Expiry: {expiry_time}
+Expiry: {EXPIRY}
 Session: 1PM-4PM GMT+1"""
-    bot.send_message(chat_id=CHAT_ID, text=msg)
+    await bot.send_message(chat_id=CHAT_ID, text=msg)
 
-def run_bot():
+async def scan_market():
     global last_signal
     now = datetime.now(LAGOS)
-    if now.hour < 13 or now.hour >= 16: return # 1PM-4PM only
+    if not (13 <= now.hour < 16 and now.weekday() < 5): return # 1PM-4PM Mon-Fri only
     
     for pair in PAIRS:
         df = get_data(pair)
@@ -90,18 +92,36 @@ def run_bot():
         if result:
             sig_type, price, adx, bb_level = result
             if last_signal.get(pair)!= sig_type:
-                send_signal(pair, sig_type, price, adx, bb_level)
+                await send_signal(pair, sig_type, price, adx, bb_level)
                 last_signal[pair] = sig_type
-        time.sleep(2)
+        await asyncio.sleep(2)
 
-schedule.every(5).minutes.do(run_bot)
+async def status(update, context):
+    t = datetime.now(LAGOS)
+    session = "OPEN 🟢" if 13 <= t.hour < 16 else "CLOSED 🔴"
+    msg = f"""MACD+BB+ADX Bot
+Time: {t.strftime('%H:%M')} GMT+1
+Session: {session}
+TF: {TIMEFRAME}
+Expiry: {EXPIRY}"""
+    await update.message.reply_text(msg)
 
-def run_schedule():
+async def scheduler_loop():
     while True:
-        schedule.run_pending()
-        time.sleep(1)
+        await scan_market()
+        await asyncio.sleep(120) # Scan every 2 mins
+
+async def post_init(application):
+    asyncio.create_task(scheduler_loop())
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    Thread(target=run_schedule, daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("status", status))
+    
+    Thread(target=run_flask, daemon=True).start()
+    print(f"MACD+BB+ADX Bot Started | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
+    app.run_polling(drop_pending_updates=True)
