@@ -115,7 +115,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     
-    # Use JobQueue instead of create_task - this fixes the reply bug
+    # This replaces create_task - fixes the crash
     job_queue = application.job_queue
     job_queue.run_repeating(scan_market, interval=120, first=10)
     
