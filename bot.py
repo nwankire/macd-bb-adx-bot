@@ -53,25 +53,20 @@ def check_signal(df):
     df["adx"] = adx.adx()
     last, prev = df.iloc[-1], df.iloc[-2]
     if pd.isna(last["adx"]) or last["adx"] < 20: return None
-    
-    # BUY signal
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
     bb_touch_low = last["Low"] <= last["bb_lower"]
     if macd_cross_up and bb_touch_low and last["macd_hist"] > 0:
-        return "BUY", last["Close"], last["adx"], last["bb_lower"]
-    
-    # SELL signal
+        return "CALL", last["Close"], last["adx"], last["bb_lower"]
     macd_cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
     bb_touch_high = last["High"] >= last["bb_upper"]
     if macd_cross_down and bb_touch_high and last["macd_hist"] < 0:
-        return "SELL", last["Close"], last["adx"], last["bb_upper"]
+        return "PUT", last["Close"], last["adx"], last["bb_upper"]
     return None
 
 async def send_signal(context: ContextTypes.DEFAULT_TYPE, pair, sig_type, price, adx, bb_level):
     global signal_history
     now = datetime.now(LAGOS).strftime("%H:%M")
-    emoji = "🟢" if sig_type == "BUY" else "🔴"
-    msg = f"""{emoji} [MACD+BB+ADX] {sig_type}
+    msg = f"""[MACD+BB+ADX] {sig_type}
 Pair: {pair}
 Price: {price:.5f}
 ADX: {adx:.1f} | BB: {bb_level:.5f}
@@ -104,7 +99,13 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("MACD+BB+ADX Bot is live.\n\nCommands:\n/status - Check session\n/last - See recent signals")
+    await update.message.reply_text(
+        "MACD+BB+ADX Bot is live.\n\n"
+        "Commands:\n"
+        "/status - Check session status\n"
+        "/pairs - Show pairs being scanned\n"
+        "/last - Show last 3 signals"
+    )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = datetime.now(LAGOS)
@@ -113,7 +114,18 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Time: {t.strftime('%H:%M')} GMT+1
 Session: {session}
 TF: {TIMEFRAME}
-Expiry: {EXPIRY}"""
+Expiry: {EXPIRY}
+Pairs: {len(PAIRS)} active"""
+    await update.message.reply_text(msg)
+
+async def pairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pairs_list = "\n".join([f"• {pair}" for pair in PAIRS])
+    msg = f"""📊 Currently scanning {len(PAIRS)} pairs:
+
+{pairs_list}
+
+Timeframe: {TIMEFRAME}
+Session: 1PM-4PM GMT+1"""
     await update.message.reply_text(msg)
 
 async def last_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -132,12 +144,14 @@ def main():
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("pairs", pairs_command)) # New
     application.add_handler(CommandHandler("last", last_signals))
     
+    # JobQueue handles the scanner
     job_queue = application.job_queue
     job_queue.run_repeating(scan_market, interval=120, first=10)
     
-    logging.info(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
+    logging.info(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1 | Pairs: {PAIRS}")
     application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
