@@ -12,7 +12,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN_V2")
 CHAT_ID = os.getenv("CHAT_ID_V2")
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 TIMEFRAME = os.getenv("TIMEFRAME", "15min")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") # Your Render URL: https://macd-bb-adx-bot.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") # https://macd-bb-adx-bot.onrender.com
 
 flask_app = Flask(__name__)
 LAGOS = pytz.timezone("Africa/Lagos")
@@ -21,7 +21,9 @@ EXPIRY = "15 Minutes" if TIMEFRAME == "15min" else "5 Minutes"
 last_signal = {}
 signal_history = []
 currently_scanning = "Idle"
-application = None # Global for webhook
+
+# Build application globally
+application = Application.builder().token(TOKEN).updater(None).build()
 
 @flask_app.route('/')
 def home(): 
@@ -29,11 +31,16 @@ def home():
 
 @flask_app.route('/webhook', methods=['POST'])
 async def webhook():
-    """Telegram sends updates here"""
-    if request.method == "POST":
-        await application.update_queue.put(Update.de_json(request.get_json(force=True), application.bot))
+    """This is where Telegram sends updates"""
+    try:
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        await application.process_update(update)
         return "ok", 200
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+        return "error", 500
 
+# Keep all your existing functions: get_data, check_signal, send_signal, scan_market
 def get_data(symbol):
     global currently_scanning
     currently_scanning = f"Fetching {symbol}..."
@@ -73,15 +80,11 @@ def check_signal(df, symbol):
     if pd.isna(last["adx"]) or last["adx"] < 20: 
         currently_scanning = "Idle"
         return None
-    
-    # BUY signal
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
     bb_touch_low = last["Low"] <= last["bb_lower"]
     if macd_cross_up and bb_touch_low and last["macd_hist"] > 0:
         currently_scanning = "Idle"
         return "BUY", last["Close"], last["adx"], last["bb_lower"]
-    
-    # SELL signal
     macd_cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
     bb_touch_high = last["High"] >= last["bb_upper"]
     if macd_cross_down and bb_touch_high and last["macd_hist"] < 0:
@@ -103,7 +106,6 @@ Expiry: {EXPIRY}
 Session: 1PM-4PM GMT+1"""
     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
     logging.info(f"Sent {sig_type} {pair}")
-    
     signal_history.append(msg)
     if len(signal_history) > 3:
         signal_history.pop(0)
@@ -170,19 +172,13 @@ async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (13 <= t.hour < 16 and t.weekday() < 5):
         await update.message.reply_text("Session closed 🔴\nBot only scans 1PM-4PM GMT+1, Mon-Fri")
         return
-    
     if currently_scanning == "Idle":
         await update.message.reply_text("⏸️ Bot is idle\nWaiting for next 2-min scan cycle...")
     else:
         await update.message.reply_text(f"🔍 {currently_scanning}")
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
-
-async def setup_webhook():
-    global application
-    application = Application.builder().token(TOKEN).build()
+async def setup():
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("pairs", pairs_command))
@@ -192,19 +188,19 @@ async def setup_webhook():
     job_queue = application.job_queue
     job_queue.run_repeating(scan_market, interval=120, first=10)
     
-    # Set webhook
-    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", drop_pending_updates=True)
+    # Initialize and set webhook
     await application.initialize()
+    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", drop_pending_updates=True)
     await application.start()
     logging.info(f"Webhook set to {WEBHOOK_URL}/webhook")
-    logging.info(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1 | Pairs: {PAIRS}")
+    logging.info(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
 
 def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(setup_webhook())
+    loop.run_until_complete(setup())
     
-    # Run Flask in main thread for Render
+    # Run Flask - this blocks and keeps the bot alive
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
 
