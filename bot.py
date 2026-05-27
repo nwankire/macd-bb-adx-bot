@@ -1,7 +1,7 @@
-import os, requests, pandas as pd, ta, asyncio, logging, time
+import os, requests, pandas as pd, ta, asyncio, logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from flask import Flask
+from flask import Flask, request
 from threading import Thread
 from datetime import datetime
 import pytz
@@ -12,18 +12,27 @@ TOKEN = os.getenv("TELEGRAM_TOKEN_V2")
 CHAT_ID = os.getenv("CHAT_ID_V2")
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 TIMEFRAME = os.getenv("TIMEFRAME", "15min")
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL") # Render gives you this automatically
 
 flask_app = Flask(__name__)
 LAGOS = pytz.timezone("Africa/Lagos")
 PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "EUR/JPY"]
 EXPIRY = "15 Minutes" if TIMEFRAME == "15min" else "5 Minutes"
 last_signal = {}
-signal_history = [] 
-currently_scanning = "Idle" # New: track which pair is being scanned
+signal_history = []
+currently_scanning = "Idle"
+application = None # Global so Flask can access it
 
 @flask_app.route('/')
 def home(): 
-    return f"MACD+BB+ADX Bot Live | TF:{TIMEFRAME} | {datetime.now(LAGOS).strftime('%H:%M')}"
+    return f"MACD+BB+ADX Bot Live | Webhook | TF:{TIMEFRAME} | {datetime.now(LAGOS).strftime('%H:%M')}"
+
+@flask_app.route(f'/{TOKEN}', methods=['POST'])
+async def webhook():
+    """Telegram sends updates here"""
+    if application:
+        await application.update_queue.put(Update.de_json(request.get_json(force=True), application.bot))
+    return 'ok'
 
 def get_data(symbol):
     global currently_scanning
@@ -65,14 +74,12 @@ def check_signal(df, symbol):
         currently_scanning = "Idle"
         return None
     
-    # BUY signal
     macd_cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
     bb_touch_low = last["Low"] <= last["bb_lower"]
     if macd_cross_up and bb_touch_low and last["macd_hist"] > 0:
         currently_scanning = "Idle"
         return "BUY", last["Close"], last["adx"], last["bb_lower"]
     
-    # SELL signal
     macd_cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
     bb_touch_high = last["High"] >= last["bb_upper"]
     if macd_cross_down and bb_touch_high and last["macd_hist"] < 0:
@@ -125,7 +132,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status - Check session status\n"
         "/pairs - Show pairs being scanned\n"
         "/last - Show last 3 signals\n"
-        "/now - Show which pair is scanning now" # New
+        "/now - Show which pair is scanning now"
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -136,7 +143,8 @@ Time: {t.strftime('%H:%M')} GMT+1
 Session: {session}
 TF: {TIMEFRAME}
 Expiry: {EXPIRY}
-Pairs: {len(PAIRS)} active"""
+Pairs: {len(PAIRS)} active
+Mode: Webhook ✅"""
     await update.message.reply_text(msg)
 
 async def pairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -155,7 +163,7 @@ async def last_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("📊 Last signals:\n\n" + "\n\n---\n\n".join(signal_history))
 
-async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE): # New
+async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = datetime.now(LAGOS)
     if not (13 <= t.hour < 16 and t.weekday() < 5):
         await update.message.reply_text("Session closed 🔴\nBot only scans 1PM-4PM GMT+1, Mon-Fri")
@@ -170,14 +178,14 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
 
+async def setup_webhook():
+    """Set webhook when bot starts"""
+    global application
+    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+    logging.info(f"Webhook set to {WEBHOOK_URL}/{TOKEN}")
+
 def main():
-    # ANTI-CONFLICT FIX
-    try:
-        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=5)
-        logging.info("Dropped pending updates + killed duplicate instances")
-        time.sleep(3)
-    except Exception as e:
-        logging.warning(f"Could not clear webhook: {e}")
+    global application
     
     Thread(target=run_flask, daemon=True).start()
     
@@ -186,13 +194,17 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("pairs", pairs_command))
     application.add_handler(CommandHandler("last", last_signals))
-    application.add_handler(CommandHandler("now", now_command)) # New
+    application.add_handler(CommandHandler("now", now_command))
     
     job_queue = application.job_queue
     job_queue.run_repeating(scan_market, interval=120, first=10)
     
-    logging.info(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1 | Pairs: {PAIRS}")
-    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    # Set webhook instead of polling
+    asyncio.get_event_loop().run_until_complete(setup_webhook())
+    
+    logging.info(f"MACD+BB+ADX Bot Starting | Webhook Mode | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
+    # Keep the script running
+    asyncio.get_event_loop().run_forever()
 
 if __name__ == "__main__":
     main()
