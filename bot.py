@@ -1,11 +1,14 @@
-import os, requests, pandas as pd, ta, asyncio
+import os, requests, pandas as pd, ta, asyncio, logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import Conflict
 from flask import Flask
 from threading import Thread
-import schedule, time
 from datetime import datetime
 import pytz
+
+# === LOGGING ===
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # === ENV VARS ===
 TOKEN = os.getenv("TELEGRAM_TOKEN_V2")
@@ -28,7 +31,7 @@ def get_data(symbol):
     try:
         r = requests.get(url, timeout=10).json()
         if "values" not in r: 
-            print(f"No data for {symbol}")
+            logging.warning(f"No data for {symbol}")
             return None
         df = pd.DataFrame(r["values"])
         df = df.astype({"open": float, "high": float, "low": float, "close": float})
@@ -36,7 +39,7 @@ def get_data(symbol):
         df["datetime"] = pd.to_datetime(df["datetime"])
         return df.sort_values("datetime")
     except Exception as e:
-        print(f"Data error {symbol}: {e}")
+        logging.error(f"Data error {symbol}: {e}")
         return None
 
 def check_signal(df):
@@ -83,16 +86,16 @@ Time: {now} GMT+1
 Expiry: {EXPIRY}
 Session: 1PM-4PM GMT+1"""
     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-    print(f"Sent {sig_type} {pair}")
+    logging.info(f"Sent {sig_type} {pair}")
 
 async def scan_market(context: ContextTypes.DEFAULT_TYPE):
     global last_signal
     now = datetime.now(LAGOS)
     if not (13 <= now.hour < 16 and now.weekday() < 5): 
-        print("Outside session 1PM-4PM")
+        logging.info("Outside session 1PM-4PM")
         return
     
-    print("Scanning market...")
+    logging.info("Scanning market...")
     for pair in PAIRS:
         df = get_data(pair)
         result = check_signal(df)
@@ -115,22 +118,32 @@ Expiry: {EXPIRY}"""
 
 async def scheduler_loop(app: Application):
     while True:
-        await scan_market(app)
+        try:
+            await scan_market(app)
+        except Exception as e:
+            logging.error(f"Scheduler error: {e}")
         await asyncio.sleep(120) # Scan every 2 mins
 
 async def post_init(app: Application):
-    asyncio.create_task(scheduler_loop(app))
+    app.create_task(scheduler_loop(app))
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
 
-if __name__ == "__main__":
+def main():
     # Start Flask in background
     Thread(target=run_flask, daemon=True).start()
     
-    # Start Telegram bot
-    application = Application.builder().token(TOKEN).post_init(post_init).build()
-    application.add_handler(CommandHandler("status", status))
-    print(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
-    application.run_polling(drop_pending_updates=True)
+    # Start Telegram bot with conflict handling
+    try:
+        application = Application.builder().token(TOKEN).post_init(post_init).build()
+        application.add_handler(CommandHandler("status", status))
+        logging.info(f"MACD+BB+ADX Bot Starting | TF:{TIMEFRAME} | 1PM-4PM GMT+1")
+        application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    except Conflict:
+        logging.error("Conflict error: Another instance is running. Stopping.")
+        exit(1)
+
+if __name__ == "__main__":
+    main()
